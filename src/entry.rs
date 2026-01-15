@@ -9,6 +9,8 @@ use rustix::io_uring::{
     op_flags_union, splice_fd_in_or_file_index_or_addr_len_union,
     IoringCqeFlags, IoringOp, IoringSqeFlags,
 };
+use rustix::net::addr::{SocketAddrLen, SocketAddrOpaque};
+use rustix::net::{RecvFlags, SendFlags, SocketFlags};
 
 /// An io_uring Completion Queue Entry.
 ///
@@ -180,6 +182,70 @@ impl Sqe {
         self.addr_or_splice_off_in.splice_off_in = off_in;
         self.splice_fd_in_or_file_index_or_addr_len.splice_fd_in =
             fd_in.as_raw_fd();
+        self.user_data.u64_ = user_data;
+    }
+
+    pub fn prep_accept(
+        &mut self,
+        user_data: u64,
+        fd: BorrowedFd,
+        addr: *mut SocketAddrOpaque,
+        addr_len: *mut SocketAddrLen,
+        flags: SocketFlags,
+    ) {
+        self.opcode = Accept;
+        self.fd = fd.as_raw_fd();
+        self.addr_or_splice_off_in.addr =
+            io_uring_ptr::new(addr.cast::<c_void>());
+        self.off_or_addr2.addr2 = io_uring_ptr::new(addr_len.cast::<c_void>());
+        self.op_flags.accept_flags = flags;
+        self.user_data.u64_ = user_data;
+    }
+
+    pub fn prep_connect(
+        &mut self,
+        user_data: u64,
+        fd: BorrowedFd,
+        addr: *const SocketAddrOpaque,
+        addr_len: SocketAddrLen,
+    ) {
+        self.opcode = Connect;
+        self.fd = fd.as_raw_fd();
+        self.addr_or_splice_off_in.addr =
+            io_uring_ptr::new(addr.cast_mut().cast::<c_void>());
+        self.off_or_addr2.off = addr_len.into();
+        self.user_data.u64_ = user_data;
+    }
+
+    pub fn prep_send(
+        &mut self,
+        user_data: u64,
+        fd: BorrowedFd,
+        buf: &[u8],
+        flags: SendFlags,
+    ) {
+        self.opcode = Send;
+        self.fd = fd.as_raw_fd();
+        self.addr_or_splice_off_in.addr =
+            io_uring_ptr::new(buf.as_ptr().cast_mut().cast::<c_void>());
+        self.set_len(buf.len());
+        self.op_flags.send_flags = flags;
+        self.user_data.u64_ = user_data;
+    }
+
+    pub fn prep_recv(
+        &mut self,
+        user_data: u64,
+        fd: BorrowedFd,
+        buf: &mut [u8],
+        flags: RecvFlags,
+    ) {
+        self.opcode = Recv;
+        self.fd = fd.as_raw_fd();
+        self.addr_or_splice_off_in.addr =
+            io_uring_ptr::new(buf.as_mut_ptr().cast::<c_void>());
+        self.set_len(buf.len());
+        self.op_flags.recv_flags = flags;
         self.user_data.u64_ = user_data;
     }
 
