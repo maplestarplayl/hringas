@@ -42,8 +42,8 @@ use core::{assert, assert_eq, assert_ne, cmp};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::io;
 use rustix::io_uring::{
-    io_uring_enter, io_uring_register, io_uring_setup, IoringFeatureFlags,
-    IoringRegisterOp, IoringSetupFlags, IoringSqFlags,
+    io_uring_buf_reg, io_uring_enter, io_uring_register, io_uring_setup,
+    IoringFeatureFlags, IoringRegisterOp, IoringSetupFlags, IoringSqFlags,
 };
 
 /// The main entry point to the library.
@@ -528,12 +528,30 @@ impl IoUring {
         io_uring_register(
             self.fd(),
             IoringRegisterOp::RegisterPbufRing,
-            &buf_ring.args() as *const _ as *mut std::ffi::c_void,
+            &buf_ring.args() as *const _ as *mut core::ffi::c_void,
             1,
         )
     }
 
-    //TODO: unregister_buf_ring?
+    /// Unregister a previously registered provided-buffer ring.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no pending SQEs reference this buffer ring.
+    pub unsafe fn unregister_pbuf_ring(
+        &mut self,
+        bgid: u16,
+    ) -> io::Result<u32> {
+        let mut reg = io_uring_buf_reg::default();
+        reg.bgid = bgid;
+
+        io_uring_register(
+            self.fd(),
+            IoringRegisterOp::UnregisterPbufRing,
+            &reg as *const _ as *mut core::ffi::c_void,
+            1,
+        )
+    }
 }
 
 // Unlike the Zig version, we do not store the mmap; as it is used by the
@@ -1302,6 +1320,23 @@ mod zig_tests {
         assert_eq!(cqe_recv.flags, IoringCqeFlags::empty());
 
         assert_eq!(&recv_buf, send_buf);
+        assert_ring_clean(&mut ring);
+    }
+
+    #[test]
+    fn register_unregister_pbuf_ring() {
+        let mut ring = IoUring::new(1).unwrap();
+
+        let bgid = 7;
+        let buf_ring = buffer::BufRing::new(bgid, 8).unwrap();
+
+        match unsafe { ring.register_pbuf_ring(&buf_ring) } {
+            Ok(_) => {}
+            Err(Errno::INVAL) => return, // Kernel too old / feature disabled.
+            Err(e) => panic!("register_pbuf_ring failed: {e:?}"),
+        }
+
+        assert!(unsafe { ring.unregister_pbuf_ring(bgid) }.is_ok());
         assert_ring_clean(&mut ring);
     }
 }
