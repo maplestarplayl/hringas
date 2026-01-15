@@ -17,15 +17,15 @@
 //! ```no_run
 #![doc = include_str!("../examples/readme.rs")]
 //! ```
-//! 
+//!
 //! Or, in `no_std`:
 //! ```no_run
 #![doc = include_str!("../examples/readme_no_std.rs")]
 //! ```
 
+pub mod buffer;
 pub mod entry;
 mod mmap;
-
 pub use crate::entry::*;
 pub use rustix;
 
@@ -52,6 +52,7 @@ pub struct IoUring {
     fd: OwnedFd,
     shared: mmap::Ioring,
     flags: IoringSetupFlags,
+    #[expect(dead_code)]
     features: IoringFeatureFlags,
     sq: SubmissionQueue,
     cq: CompletionQueue,
@@ -513,6 +514,22 @@ impl IoUring {
                 .len()
                 .try_into()
                 .expect("length of buffers must fit in a u32"),
+        )
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure that no pending SQEs reference the registered
+    /// buffers.
+    pub unsafe fn register_pbuf_ring(
+        &mut self,
+        buf_ring: &buffer::BufRing,
+    ) -> io::Result<u32> {
+        io_uring_register(
+            self.fd(),
+            IoringRegisterOp::RegisterPbufRing,
+            &buf_ring.args() as *const _ as *mut std::ffi::c_void,
+            1,
         )
     }
 }
