@@ -662,8 +662,8 @@ mod zig_tests {
     use rustix::{
         // TODO: the only place we use these constants, is in these tests?
         io_uring::{
-            io_uring_ptr, ioprio_union, IoringCqeFlags, IoringOp,
-            IoringSqeFlags,
+            io_uring_ptr, ioprio_union, IoringAcceptFlags, IoringCqeFlags,
+            IoringOp, IoringRecvFlags, IoringSqeFlags,
         },
     };
     use tempfile::{tempdir, TempDir};
@@ -1321,6 +1321,69 @@ mod zig_tests {
 
         assert_eq!(&recv_buf, send_buf);
         assert_ring_clean(&mut ring);
+    }
+
+    #[test]
+    fn multishot_accept_prep() {
+        let mut ring = IoUring::new(1).unwrap();
+
+        let accept_sock = net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+
+        let sqe = ring.get_sqe().unwrap();
+        sqe.prep_multishot_accept(0xabababab, accept_sock.as_fd());
+
+        assert_eq!(sqe.opcode, IoringOp::Accept);
+        assert_eq!(sqe.flags, IoringSqeFlags::empty());
+        assert_eq!(sqe.fd, accept_sock.as_raw_fd());
+        assert_eq!(sqe.addr(), io_uring_ptr::null());
+        assert_eq!(
+            unsafe { sqe.off_or_addr2.addr2.ptr },
+            core::ptr::null_mut::<c_void>()
+        );
+        assert_eq!(
+            unsafe { sqe.ioprio.accept_flags },
+            IoringAcceptFlags::MULTISHOT
+        );
+        assert_eq!(unsafe { sqe.op_flags.accept_flags }, SocketFlags::empty());
+        assert_eq!(unsafe { sqe.len.len }, 0);
+        assert_eq!(unsafe { sqe.buf.buf_group }, 0);
+        assert_eq!(sqe.user_data.u64_(), 0xabababab);
+    }
+
+    #[test]
+    fn multishot_recv_prep() {
+        let mut ring = IoUring::new(1).unwrap();
+
+        let (sock_a, _sock_b) = net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+
+        let sqe = ring.get_sqe().unwrap();
+        sqe.prep_multishot_recv(0xcccccccc, sock_a.as_fd(), 7);
+
+        assert_eq!(sqe.opcode, IoringOp::Recv);
+        assert_eq!(sqe.flags, IoringSqeFlags::BUFFER_SELECT);
+        assert_eq!(sqe.fd, sock_a.as_raw_fd());
+        assert_eq!(sqe.addr(), io_uring_ptr::null());
+        assert_eq!(sqe.off(), 0);
+        assert_eq!(unsafe { sqe.op_flags.recv_flags }, RecvFlags::empty());
+        assert_eq!(
+            unsafe { sqe.ioprio.recv_flags },
+            IoringRecvFlags::MULTISHOT
+        );
+        assert_eq!(unsafe { sqe.buf.buf_group }, 7);
+        assert_eq!(unsafe { sqe.len.len }, 0);
+        assert_eq!(sqe.user_data.u64_(), 0xcccccccc);
     }
 
     #[test]

@@ -2,13 +2,13 @@ use core::ffi::{c_void, CStr};
 use rustix::fd::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::ReadWriteFlags;
-use rustix::io_uring::IoringOp::*;
 use rustix::io_uring::{
     addr3_or_cmd_union, addr_or_splice_off_in_union, buf_union, io_uring_ptr,
     io_uring_user_data, ioprio_union, iovec, len_union, off_or_addr2_union,
     op_flags_union, splice_fd_in_or_file_index_or_addr_len_union,
-    IoringCqeFlags, IoringOp, IoringSqeFlags,
+    IoringAcceptFlags, IoringCqeFlags, IoringOp, IoringSqeFlags,
 };
+use rustix::io_uring::{IoringOp::*, IoringRecvFlags};
 use rustix::net::addr::{SocketAddrLen, SocketAddrOpaque};
 use rustix::net::{RecvFlags, SendFlags, SocketFlags};
 
@@ -298,6 +298,64 @@ impl Sqe {
     pub fn prep_close(&mut self, user_data: u64, fd: OwnedFd) {
         self.opcode = Close;
         self.fd = fd.into_raw_fd();
+        self.user_data.u64_ = user_data;
+    }
+
+    pub fn prep_multishot_recv(
+        &mut self,
+        user_data: u64,
+        fd: BorrowedFd,
+        bgid: u16,
+    ) {
+        self.opcode = IoringOp::Recv;
+        self.fd = fd.as_raw_fd();
+
+        self.flags.set(IoringSqeFlags::BUFFER_SELECT, true);
+        self.ioprio.recv_flags = IoringRecvFlags::MULTISHOT;
+        self.buf.buf_group = bgid;
+
+        self.user_data.u64_ = user_data;
+
+        self.set_len(0);
+        self.set_buf(core::ptr::null::<c_void>(), 0, 0);
+    }
+
+    pub fn prep_multishot_accept(
+        &mut self,
+        user_data: u64,
+        fd: BorrowedFd,
+    ) {
+        self.opcode = IoringOp::Accept;
+        self.fd = fd.as_raw_fd();
+
+        self.ioprio.accept_flags = IoringAcceptFlags::MULTISHOT;
+
+        self.user_data.u64_ = user_data;
+
+        self.addr_or_splice_off_in.addr =
+            io_uring_ptr::new(core::ptr::null_mut::<c_void>());
+        self.off_or_addr2.addr2 =
+            io_uring_ptr::new(core::ptr::null_mut::<c_void>());
+        self.set_len(0);
+    }
+
+
+    pub fn prep_recv_provided(
+        &mut self,
+        user_data: u64,
+        fd: BorrowedFd,
+        bgid: u16,
+        buf_len: usize,
+        flags: RecvFlags,
+    ) {
+        self.opcode = Recv;
+        self.fd = fd.as_raw_fd();
+        self.addr_or_splice_off_in.addr =
+            io_uring_ptr::new(core::ptr::null_mut());
+        self.set_len(buf_len);
+        self.buf.buf_group = bgid;
+        self.flags.set(IoringSqeFlags::BUFFER_SELECT, true);
+        self.op_flags.recv_flags = flags;
         self.user_data.u64_ = user_data;
     }
 }

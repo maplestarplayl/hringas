@@ -90,11 +90,20 @@ impl BufRing {
         let entry_size = std::mem::size_of::<io_uring_buf>();
         let mem = alloc::AlignedMem::new(entry_size * ring_entries as usize)?;
 
+        #[repr(C)]
+        struct BufRingHeader {
+            _resv1: u64,
+            _resv2: u32,
+            _resv3: u16,
+            tail: u16,
+        }
+        let tail_offset = core::mem::offset_of!(BufRingHeader, tail);
         // SAFETY: `mem` is at least `header_size` bytes, page-aligned, and we
-        // treat the first 2 bytes as the atomic `tail` field.
+        // only read from the `tail` field.
         let shared_tail = unsafe {
-            // Offset of `tail` field in `io_uring_buf_ring` is 14 bytes, ie. the last two bytes of buf[0]
-            AtomicU16::from_ptr(mem.as_mut_ptr().byte_add(14).cast::<u16>())
+            AtomicU16::from_ptr(
+                mem.as_mut_ptr().byte_add(tail_offset).cast::<u16>(),
+            )
         };
 
         Ok(Self {
