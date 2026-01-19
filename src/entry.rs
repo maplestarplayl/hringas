@@ -320,11 +320,7 @@ impl Sqe {
         self.set_buf(core::ptr::null::<c_void>(), 0, 0);
     }
 
-    pub fn prep_multishot_accept(
-        &mut self,
-        user_data: u64,
-        fd: BorrowedFd,
-    ) {
+    pub fn prep_multishot_accept(&mut self, user_data: u64, fd: BorrowedFd) {
         self.opcode = IoringOp::Accept;
         self.fd = fd.as_raw_fd();
 
@@ -337,8 +333,9 @@ impl Sqe {
         self.off_or_addr2.addr2 =
             io_uring_ptr::new(core::ptr::null_mut::<c_void>());
         self.set_len(0);
+        self.op_flags.accept_flags =
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC;
     }
-
 
     pub fn prep_recv_provided(
         &mut self,

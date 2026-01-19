@@ -2,7 +2,9 @@ use hringas::IoUring;
 use rustix::fd::{AsFd, FromRawFd, OwnedFd};
 use rustix::io::Errno;
 use rustix::io_uring::IoringCqeFlags;
-use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+use rustix::net::{
+    self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType,
+};
 use tempfile::TempDir;
 
 fn main() {
@@ -17,13 +19,13 @@ fn main() {
     .unwrap();
 
     let tmp = TempDir::new().unwrap();
-    let addr = SocketAddrUnix::new(tmp.path().join("hringas_ms_accept.sock"))
-        .unwrap();
+    let addr =
+        SocketAddrUnix::new(tmp.path().join("hringas_ms_accept.sock")).unwrap();
     net::bind(listener.as_fd(), &addr).unwrap();
     net::listen(listener.as_fd(), 8).unwrap();
 
     let sqe = ring.get_sqe().unwrap();
-    sqe.prep_multishot_accept(0x1111_1111, listener.as_fd(),);
+    sqe.prep_multishot_accept(0x1111_1111, listener.as_fd());
     assert_eq!(unsafe { ring.submit() }, Ok(1));
 
     let client_a = net::socket_with(
@@ -59,8 +61,7 @@ fn main() {
         if cqe.flags.contains(IoringCqeFlags::MORE) {
             saw_more = true;
         }
-        let _accepted_fd =
-            unsafe { OwnedFd::from_raw_fd(cqe.res) };
+        let _accepted_fd = unsafe { OwnedFd::from_raw_fd(cqe.res) };
         accepted += 1;
     }
 
