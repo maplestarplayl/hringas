@@ -17,15 +17,15 @@
 //! ```no_run
 #![doc = include_str!("../examples/readme.rs")]
 //! ```
-//! 
+//!
 //! Or, in `no_std`:
 //! ```no_run
 #![doc = include_str!("../examples/readme_no_std.rs")]
 //! ```
 
+pub mod buffer;
 pub mod entry;
 mod mmap;
-
 pub use crate::entry::*;
 pub use rustix;
 
@@ -42,8 +42,8 @@ use core::{assert, assert_eq, assert_ne, cmp};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::io;
 use rustix::io_uring::{
-    io_uring_enter, io_uring_register, io_uring_setup, IoringFeatureFlags,
-    IoringRegisterOp, IoringSetupFlags, IoringSqFlags,
+    io_uring_buf_reg, io_uring_enter, io_uring_register, io_uring_setup,
+    IoringFeatureFlags, IoringRegisterOp, IoringSetupFlags, IoringSqFlags,
 };
 
 /// The main entry point to the library.
@@ -52,6 +52,7 @@ pub struct IoUring {
     fd: OwnedFd,
     shared: mmap::Ioring,
     flags: IoringSetupFlags,
+    #[expect(dead_code)]
     features: IoringFeatureFlags,
     sq: SubmissionQueue,
     cq: CompletionQueue,
@@ -515,6 +516,42 @@ impl IoUring {
                 .expect("length of buffers must fit in a u32"),
         )
     }
+
+    /// # Safety
+    ///
+    /// The caller must ensure that no pending SQEs reference the registered
+    /// buffers.
+    pub unsafe fn register_pbuf_ring(
+        &mut self,
+        buf_ring: &buffer::BufRing,
+    ) -> io::Result<u32> {
+        io_uring_register(
+            self.fd(),
+            IoringRegisterOp::RegisterPbufRing,
+            &buf_ring.args() as *const _ as *mut core::ffi::c_void,
+            1,
+        )
+    }
+
+    /// Unregister a previously registered provided-buffer ring.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no pending SQEs reference this buffer ring.
+    pub unsafe fn unregister_pbuf_ring(
+        &mut self,
+        bgid: u16,
+    ) -> io::Result<u32> {
+        let mut reg = io_uring_buf_reg::default();
+        reg.bgid = bgid;
+
+        io_uring_register(
+            self.fd(),
+            IoringRegisterOp::UnregisterPbufRing,
+            &reg as *const _ as *mut core::ffi::c_void,
+            1,
+        )
+    }
 }
 
 // Unlike the Zig version, we do not store the mmap; as it is used by the
@@ -610,16 +647,23 @@ mod test_ioring_op_uring_cmd {
 mod zig_tests {
     use super::*;
     use core::ffi::c_void;
+    use core::mem::{size_of, MaybeUninit};
     use err::*;
     use pretty_assertions::assert_eq;
     use rustix::fd::AsRawFd;
     use rustix::fs::{self, Mode, OFlags, CWD};
     use rustix::io::Errno;
+    use rustix::net::addr::{
+        SocketAddrLen, SocketAddrOpaque, SocketAddrStorage,
+    };
+    use rustix::net::{
+        self, AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType,
+    };
     use rustix::{
         // TODO: the only place we use these constants, is in these tests?
         io_uring::{
-            io_uring_ptr, ioprio_union, IoringCqeFlags, IoringOp,
-            IoringSqeFlags,
+            io_uring_ptr, ioprio_union, IoringAcceptFlags, IoringCqeFlags,
+            IoringOp, IoringRecvFlags, IoringSqeFlags,
         },
     };
     use tempfile::{tempdir, TempDir};
@@ -794,7 +838,7 @@ mod zig_tests {
         }];
 
         let mut buffer_read = [0u8; 128];
-        let mut iovecs_read = [iovec {
+        let iovecs_read = [iovec {
             iov_base: buffer_read.as_mut_ptr().cast(),
             iov_len: buffer_read.len(),
         }];
@@ -815,7 +859,7 @@ mod zig_tests {
         }
         {
             let sqe = ring.get_sqe().unwrap();
-            sqe.prep_readv(0xffffffff, fd.as_fd(), &mut iovecs_read, 17);
+            sqe.prep_readv(0xffffffff, fd.as_fd(), &iovecs_read, 17);
             assert_eq!(sqe.opcode, IoringOp::Readv);
             assert_eq!(sqe.off(), 17);
         }
@@ -1104,6 +1148,258 @@ mod zig_tests {
         assert_eq!(cqe.user_data.u64_(), 0x44444444);
         assert!(cqe.flags.is_empty());
 
+        assert_ring_clean(&mut ring);
+    }
+
+    #[test]
+    fn accept_connect() {
+        let mut ring = IoUring::new(2).unwrap();
+
+        let accept_sock = net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+
+        let connect_sock = net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+
+        // No socket exists at this path; connect should fail with
+        // `Errno::NOENT` without requiring `bind`/`listen` (which may be
+        // restricted in some sandboxed environments).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let connect_addr = net::SocketAddrUnix::new(
+            tmp.path().join("hringas_accept_connect_no_such.sock"),
+        )
+        .unwrap();
+        let connect_addr: net::SocketAddrAny = connect_addr.into();
+
+        let mut peer_storage = MaybeUninit::<SocketAddrStorage>::uninit();
+        let mut peer_len: SocketAddrLen = size_of::<SocketAddrStorage>() as _;
+
+        {
+            let sqe_accept = ring.get_sqe().unwrap();
+            sqe_accept.prep_accept(
+                0x11111111,
+                accept_sock.as_fd(),
+                peer_storage.as_mut_ptr().cast::<SocketAddrOpaque>(),
+                &mut peer_len,
+                SocketFlags::CLOEXEC,
+            );
+
+            assert_eq!(sqe_accept.opcode, IoringOp::Accept);
+            assert_eq!(sqe_accept.flags, IoringSqeFlags::empty());
+            assert_eq!(sqe_accept.fd, accept_sock.as_raw_fd());
+            assert_eq!(sqe_accept.addr().ptr, peer_storage.as_mut_ptr().cast());
+            assert_eq!(
+                unsafe { sqe_accept.off_or_addr2.addr2.ptr },
+                (&mut peer_len as *mut SocketAddrLen).cast::<c_void>()
+            );
+            assert_eq!(
+                unsafe { sqe_accept.op_flags.accept_flags },
+                SocketFlags::CLOEXEC
+            );
+            assert_eq!(sqe_accept.user_data.u64_(), 0x11111111);
+        }
+
+        {
+            let sqe_connect = ring.get_sqe().unwrap();
+            sqe_connect.prep_connect(
+                0x22222222,
+                connect_sock.as_fd(),
+                connect_addr.as_ptr().cast::<SocketAddrOpaque>(),
+                connect_addr.addr_len(),
+            );
+
+            assert_eq!(sqe_connect.opcode, IoringOp::Connect);
+            assert_eq!(sqe_connect.flags, IoringSqeFlags::empty());
+            assert_eq!(sqe_connect.fd, connect_sock.as_raw_fd());
+            assert_eq!(
+                sqe_connect.addr().ptr,
+                connect_addr.as_ptr().cast::<c_void>().cast_mut()
+            );
+            assert_eq!(sqe_connect.off(), connect_addr.addr_len() as u64);
+            assert_eq!(sqe_connect.user_data.u64_(), 0x22222222);
+        }
+
+        assert_eq!(unsafe { ring.submit() }, Ok(2));
+
+        let cqe1 = unsafe { ring.copy_cqe() }.unwrap();
+        let cqe2 = unsafe { ring.copy_cqe() }.unwrap();
+
+        let (cqe_accept, cqe_connect) = if cqe1.user_data.u64_() == 0x11111111 {
+            (cqe1, cqe2)
+        } else {
+            (cqe2, cqe1)
+        };
+
+        assert_eq!(cqe_connect.user_data.u64_(), 0x22222222);
+        assert_eq!(
+            cqe_connect.res.checked_neg().map(Errno::from_raw_os_error),
+            Some(Errno::NOENT)
+        );
+        assert_eq!(cqe_connect.flags, IoringCqeFlags::empty());
+
+        assert_eq!(cqe_accept.user_data.u64_(), 0x11111111);
+        assert_eq!(
+            cqe_accept.res.checked_neg().map(Errno::from_raw_os_error),
+            Some(Errno::INVAL)
+        );
+        assert_eq!(cqe_accept.flags, IoringCqeFlags::empty());
+
+        assert_ring_clean(&mut ring);
+    }
+
+    #[test]
+    fn send_recv() {
+        let mut ring = IoUring::new(2).unwrap();
+
+        let (sock_a, sock_b) = net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+
+        let send_buf = b"hello";
+        let mut recv_buf = [0u8; 5];
+
+        let sqe_recv = ring.get_sqe().unwrap();
+        sqe_recv.prep_recv(
+            0x12121212,
+            sock_a.as_fd(),
+            &mut recv_buf,
+            RecvFlags::empty(),
+        );
+        assert_eq!(sqe_recv.opcode, IoringOp::Recv);
+        assert_eq!(sqe_recv.fd, sock_a.as_raw_fd());
+        assert_eq!(sqe_recv.addr().ptr, recv_buf.as_mut_ptr().cast());
+        assert_eq!(unsafe { sqe_recv.len.len }, recv_buf.len() as u32);
+        assert_eq!(unsafe { sqe_recv.op_flags.recv_flags }, RecvFlags::empty());
+        assert_eq!(sqe_recv.user_data.u64_(), 0x12121212);
+
+        let sqe_send = ring.get_sqe().unwrap();
+        sqe_send.prep_send(
+            0x34343434,
+            sock_b.as_fd(),
+            send_buf,
+            SendFlags::empty(),
+        );
+        assert_eq!(sqe_send.opcode, IoringOp::Send);
+        assert_eq!(sqe_send.fd, sock_b.as_raw_fd());
+        assert_eq!(sqe_send.addr().ptr, send_buf.as_ptr().cast_mut().cast());
+        assert_eq!(unsafe { sqe_send.len.len }, send_buf.len() as u32);
+        assert_eq!(unsafe { sqe_send.op_flags.send_flags }, SendFlags::empty());
+        assert_eq!(sqe_send.user_data.u64_(), 0x34343434);
+
+        assert_eq!(unsafe { ring.submit() }, Ok(2));
+
+        let cqe1 = unsafe { ring.copy_cqe() }.unwrap();
+        let cqe2 = unsafe { ring.copy_cqe() }.unwrap();
+
+        let (cqe_send, cqe_recv) = if cqe1.user_data.u64_() == 0x34343434 {
+            (cqe1, cqe2)
+        } else {
+            (cqe2, cqe1)
+        };
+
+        assert_eq!(cqe_send.user_data.u64_(), 0x34343434);
+        assert_eq!(cqe_send.res, send_buf.len() as i32);
+        assert_eq!(cqe_send.flags, IoringCqeFlags::empty());
+
+        assert_eq!(cqe_recv.user_data.u64_(), 0x12121212);
+        assert_eq!(cqe_recv.res, recv_buf.len() as i32);
+        assert_eq!(cqe_recv.flags, IoringCqeFlags::empty());
+
+        assert_eq!(&recv_buf, send_buf);
+        assert_ring_clean(&mut ring);
+    }
+
+    #[test]
+    fn multishot_accept_prep() {
+        let mut ring = IoUring::new(1).unwrap();
+
+        let accept_sock = net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+
+        let sqe = ring.get_sqe().unwrap();
+        sqe.prep_multishot_accept(0xabababab, accept_sock.as_fd());
+
+        assert_eq!(sqe.opcode, IoringOp::Accept);
+        assert_eq!(sqe.flags, IoringSqeFlags::empty());
+        assert_eq!(sqe.fd, accept_sock.as_raw_fd());
+        assert_eq!(sqe.addr(), io_uring_ptr::null());
+        assert_eq!(
+            unsafe { sqe.off_or_addr2.addr2.ptr },
+            core::ptr::null_mut::<c_void>()
+        );
+        assert_eq!(
+            unsafe { sqe.ioprio.accept_flags },
+            IoringAcceptFlags::MULTISHOT
+        );
+        assert_eq!(unsafe { sqe.op_flags.accept_flags }, SocketFlags::empty());
+        assert_eq!(unsafe { sqe.len.len }, 0);
+        assert_eq!(unsafe { sqe.buf.buf_group }, 0);
+        assert_eq!(sqe.user_data.u64_(), 0xabababab);
+    }
+
+    #[test]
+    fn multishot_recv_prep() {
+        let mut ring = IoUring::new(1).unwrap();
+
+        let (sock_a, _sock_b) = net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+
+        let sqe = ring.get_sqe().unwrap();
+        sqe.prep_multishot_recv(0xcccccccc, sock_a.as_fd(), 7);
+
+        assert_eq!(sqe.opcode, IoringOp::Recv);
+        assert_eq!(sqe.flags, IoringSqeFlags::BUFFER_SELECT);
+        assert_eq!(sqe.fd, sock_a.as_raw_fd());
+        assert_eq!(sqe.addr(), io_uring_ptr::null());
+        assert_eq!(sqe.off(), 0);
+        assert_eq!(unsafe { sqe.op_flags.recv_flags }, RecvFlags::empty());
+        assert_eq!(
+            unsafe { sqe.ioprio.recv_flags },
+            IoringRecvFlags::MULTISHOT
+        );
+        assert_eq!(unsafe { sqe.buf.buf_group }, 7);
+        assert_eq!(unsafe { sqe.len.len }, 0);
+        assert_eq!(sqe.user_data.u64_(), 0xcccccccc);
+    }
+
+    #[test]
+    fn register_unregister_pbuf_ring() {
+        let mut ring = IoUring::new(1).unwrap();
+
+        let bgid = 7;
+        let buf_ring = buffer::BufRing::new(bgid, 8).unwrap();
+
+        match unsafe { ring.register_pbuf_ring(&buf_ring) } {
+            Ok(_) => {}
+            Err(Errno::INVAL) => return, // Kernel too old / feature disabled.
+            Err(e) => panic!("register_pbuf_ring failed: {e:?}"),
+        }
+
+        assert!(unsafe { ring.unregister_pbuf_ring(bgid) }.is_ok());
         assert_ring_clean(&mut ring);
     }
 }
