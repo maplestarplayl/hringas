@@ -33,8 +33,8 @@ pub use rustix;
 pub use rustix::fd::BorrowedFd;
 pub use rustix::io::Errno;
 pub use rustix::io_uring::{
-    io_uring_params, iovec, IoringEnterFlags, IoringOp, IoringSqeFlags,
-    ReadWriteFlags,
+    io_uring_params, iovec, IoringAsyncCancelFlags, IoringEnterFlags, IoringOp,
+    IoringSqeFlags, IoringTimeoutFlags, ReadWriteFlags, Timespec,
 };
 
 use core::ptr::null;

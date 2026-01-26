@@ -6,7 +6,8 @@ use rustix::io_uring::{
     addr3_or_cmd_union, addr_or_splice_off_in_union, buf_union, io_uring_ptr,
     io_uring_user_data, ioprio_union, iovec, len_union, off_or_addr2_union,
     op_flags_union, splice_fd_in_or_file_index_or_addr_len_union,
-    IoringAcceptFlags, IoringCqeFlags, IoringOp, IoringSqeFlags,
+    IoringAcceptFlags, IoringAsyncCancelFlags, IoringCqeFlags, IoringOp,
+    IoringSqeFlags, IoringTimeoutFlags, Timespec,
 };
 use rustix::io_uring::{IoringOp::*, IoringRecvFlags};
 use rustix::net::addr::{SocketAddrLen, SocketAddrOpaque};
@@ -301,6 +302,81 @@ impl Sqe {
         self.user_data.u64_ = user_data;
     }
 
+    pub fn prep_timeout(
+        &mut self,
+        user_data: u64,
+        timespec: &Timespec,
+        count: u32,
+        flags: IoringTimeoutFlags,
+    ) {
+        self.opcode = Timeout;
+        self.fd = -1;
+        self.addr_or_splice_off_in.addr =
+            io_uring_ptr::new(timespec as *const _ as *mut c_void);
+        self.set_len(1);
+        self.off_or_addr2.off = count.into();
+        self.op_flags.timeout_flags = flags;
+        self.user_data.u64_ = user_data;
+    }
+
+    pub fn prep_timeout_remove(
+        &mut self,
+        user_data: u64,
+        target_user_data: u64,
+    ) {
+        self.opcode = TimeoutRemove;
+        self.fd = -1;
+        self.addr_or_splice_off_in.user_data = target_user_data.into();
+        self.set_len(0);
+        self.user_data.u64_ = user_data;
+    }
+
+    pub fn prep_timeout_update(
+        &mut self,
+        user_data: u64,
+        target_user_data: u64,
+        timespec: &Timespec,
+        flags: IoringTimeoutFlags,
+    ) {
+        self.opcode = TimeoutRemove;
+        self.fd = -1;
+        self.addr_or_splice_off_in.addr =
+            io_uring_ptr::new(timespec as *const _ as *mut c_void);
+        self.set_len(1);
+        self.off_or_addr2.off = target_user_data;
+        self.op_flags.timeout_flags = flags | IoringTimeoutFlags::UPDATE;
+        self.user_data.u64_ = user_data;
+    }
+
+    pub fn prep_link_timeout(
+        &mut self,
+        user_data: u64,
+        timespec: &Timespec,
+        flags: IoringTimeoutFlags,
+    ) {
+        self.opcode = LinkTimeout;
+        self.fd = -1;
+        self.addr_or_splice_off_in.addr =
+            io_uring_ptr::new(timespec as *const _ as *mut c_void);
+        self.set_len(1);
+        self.op_flags.timeout_flags = flags;
+        self.user_data.u64_ = user_data;
+    }
+
+    pub fn prep_async_cancel(
+        &mut self,
+        user_data: u64,
+        target_user_data: u64,
+        flags: IoringAsyncCancelFlags,
+    ) {
+        self.opcode = AsyncCancel;
+        self.fd = -1;
+        self.addr_or_splice_off_in.user_data = target_user_data.into();
+        self.set_len(0);
+        self.op_flags.cancel_flags = flags;
+        self.user_data.u64_ = user_data;
+    }
+
     pub fn prep_multishot_recv(
         &mut self,
         user_data: u64,
@@ -333,8 +409,7 @@ impl Sqe {
         self.off_or_addr2.addr2 =
             io_uring_ptr::new(core::ptr::null_mut::<c_void>());
         self.set_len(0);
-        self.op_flags.accept_flags =
-            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC;
+        self.op_flags.accept_flags = SocketFlags::empty();
     }
 
     pub fn prep_recv_provided(
@@ -354,5 +429,99 @@ impl Sqe {
         self.flags.set(IoringSqeFlags::BUFFER_SELECT, true);
         self.op_flags.recv_flags = flags;
         self.user_data.u64_ = user_data;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::ffi::c_void;
+
+    #[test]
+    fn prep_timeout_fields() {
+        let mut sqe = Sqe::default();
+        let ts = Timespec { tv_sec: 1, tv_nsec: 2 };
+
+        sqe.prep_timeout(0x1111, &ts, 3, IoringTimeoutFlags::ABS);
+
+        assert_eq!(sqe.opcode, IoringOp::Timeout);
+        assert_eq!(sqe.fd, -1);
+        assert_eq!(sqe.user_data.u64_(), 0x1111);
+        assert_eq!(sqe.off(), 3);
+        assert_eq!(
+            sqe.addr(),
+            io_uring_ptr::new(&ts as *const _ as *mut c_void)
+        );
+        assert_eq!(unsafe { sqe.len.len }, 1);
+        assert_eq!(
+            unsafe { sqe.op_flags.timeout_flags },
+            IoringTimeoutFlags::ABS
+        );
+    }
+
+    #[test]
+    fn prep_link_timeout_fields() {
+        let mut sqe = Sqe::default();
+        let ts = Timespec { tv_sec: 9, tv_nsec: 10 };
+
+        sqe.prep_link_timeout(0x2222, &ts, IoringTimeoutFlags::REALTIME);
+
+        assert_eq!(sqe.opcode, IoringOp::LinkTimeout);
+        assert_eq!(sqe.fd, -1);
+        assert_eq!(sqe.user_data.u64_(), 0x2222);
+        assert_eq!(
+            sqe.addr(),
+            io_uring_ptr::new(&ts as *const _ as *mut c_void)
+        );
+        assert_eq!(unsafe { sqe.len.len }, 1);
+        assert_eq!(
+            unsafe { sqe.op_flags.timeout_flags },
+            IoringTimeoutFlags::REALTIME
+        );
+    }
+
+    #[test]
+    fn prep_timeout_update_fields() {
+        let mut sqe = Sqe::default();
+        let ts = Timespec { tv_sec: 4, tv_nsec: 5 };
+
+        sqe.prep_timeout_update(
+            0x3333,
+            0x4444,
+            &ts,
+            IoringTimeoutFlags::BOOTTIME,
+        );
+
+        assert_eq!(sqe.opcode, IoringOp::TimeoutRemove);
+        assert_eq!(sqe.fd, -1);
+        assert_eq!(sqe.user_data.u64_(), 0x3333);
+        assert_eq!(sqe.off(), 0x4444);
+        assert_eq!(
+            sqe.addr(),
+            io_uring_ptr::new(&ts as *const _ as *mut c_void)
+        );
+        assert_eq!(unsafe { sqe.len.len }, 1);
+        let flags = unsafe { sqe.op_flags.timeout_flags };
+        assert!(flags.contains(IoringTimeoutFlags::BOOTTIME));
+        assert!(flags.contains(IoringTimeoutFlags::UPDATE));
+    }
+
+    #[test]
+    fn prep_async_cancel_fields() {
+        let mut sqe = Sqe::default();
+
+        sqe.prep_async_cancel(0x5555, 0x6666, IoringAsyncCancelFlags::ALL);
+
+        assert_eq!(sqe.opcode, IoringOp::AsyncCancel);
+        assert_eq!(sqe.fd, -1);
+        assert_eq!(sqe.user_data.u64_(), 0x5555);
+        assert_eq!(
+            unsafe { sqe.addr_or_splice_off_in.user_data.u64_() },
+            0x6666
+        );
+        assert_eq!(
+            unsafe { sqe.op_flags.cancel_flags },
+            IoringAsyncCancelFlags::ALL
+        );
     }
 }
